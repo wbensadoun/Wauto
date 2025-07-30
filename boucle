@@ -1,0 +1,436 @@
+# Configuration COREXT mise à jour pour gérer 4 requêtes SELECT
+self.corext_config = {
+    # Colonnes Excel utilisées pour construire les conditions WHERE des SELECT
+    "excel_input_columns": ["ID", "Name", "Type"],  
+    
+    # Configuration des 4 requêtes SELECT à exécuter
+    "select_queries": {
+        "query_1": {
+            "description": "Récupération des données principales",
+            "table": "corext_main_source",
+            "columns": ["corext_id", "corext_name", "corext_type", "status", "created_date"],
+            "where_mapping": {
+                "ID": "corext_id",
+                "Name": "corext_name", 
+                "Type": "corext_type"
+            }
+        },
+        "query_2": {
+            "description": "Récupération des détails complémentaires",
+            "table": "corext_details_source", 
+            "columns": ["detail_id", "corext_ref", "detail_value", "priority"],
+            "where_mapping": {
+                "ID": "corext_ref",  # Jointure par ID
+                "Name": "detail_name"
+            }
+        },
+        "query_3": {
+            "description": "Récupération des métadonnées",
+            "table": "corext_metadata",
+            "columns": ["meta_id", "corext_link", "metadata_json", "last_update"],
+            "where_mapping": {
+                "ID": "corext_link",
+                "Type": "meta_type"
+            }
+        },
+        "query_4": {
+            "description": "Requête avec jointure sur 2 tables",
+            "sql_template": """
+                SELECT 
+                    m.corext_id, 
+                    m.corext_name,
+                    d.detail_value,
+                    d.config_param,
+                    m.status,
+                    d.last_modified
+                FROM corext_main_source m
+                INNER JOIN corext_config_details d ON m.corext_id = d.corext_ref
+                WHERE m.corext_id = ? 
+                  AND m.corext_name = ?
+                  AND d.config_type = ?
+            """,
+            "where_mapping": {
+                "ID": 0,      # Position du paramètre dans la requête (corext_id = ?)
+                "Name": 1,    # Position du paramètre (corext_name = ?)
+                "Type": 2     # Position du paramètre (config_type = ?)
+            }
+        }
+    },
+    
+    # Tables cibles pour INSERT/DELETE (après les SELECT)
+    "target_tables": {
+        "main_table": {
+            "name": "corext_target_main",
+            "columns_mapping": {
+                # Mapping depuis les résultats des SELECT vers cette table
+                "corext_id": "target_corext_id",
+                "corext_name": "target_name",
+                "status": "target_status",
+                "detail_value": "config_value"
+            }
+        },
+        "details_table": {
+            "name": "corext_target_details", 
+            "columns_mapping": {
+                "detail_id": "target_detail_id",
+                "corext_ref": "target_corext_ref",
+                "metadata_json": "config_json",
+                "config_param": "param_name"
+            }
+        }
+    }
+}
+
+def process_corext(self, sheet_data, sheet_name):
+    """
+    Traite les données COREXT déjà groupées
+    sheet_data est maintenant une liste de groupes : [[{row1}, {row2}], [{row3}], ...]
+    """
+    print(f"\n--- Traitement COREXT: {len(sheet_data)} groupes ---")
+    
+    # Séparer les groupes par action
+    delete_groups = []
+    insert_groups = []
+    
+    for group_index, group_rows in enumerate(sheet_data):
+        if not group_rows:
+            continue
+            
+        # Déterminer l'action du groupe (prendre la première ligne)
+        first_row = group_rows[0]
+        action = first_row.get("Actions (C,D)", "").strip().upper()
+        
+        print(f"  Groupe {group_index + 1}: {len(group_rows)} lignes, Action='{action}'")
+        
+        if action == "D":
+            delete_groups.append((group_index + 1, group_rows))
+        elif action == "C":
+            insert_groups.append((group_index + 1, group_rows))
+        else:
+            print(f"    Action non reconnue: '{action}'")
+    
+    print(f"COREXT: {len(delete_groups)} groupes DELETE, {len(insert_groups)} groupes INSERT")
+    total_processed = 0
+    
+    # 1. TRAITER LES DELETE EN PREMIER (par groupe)
+    if delete_groups:
+        print(f"\n=== COREXT PHASE 1: {len(delete_groups)} groupes DELETE ===")
+        for group_num, group_rows in delete_groups:
+            try:
+                print(f"\n--- DELETE Groupe {group_num}: {len(group_rows)} lignes ---")
+                self.print_group_info(group_rows)
+                
+                group_processed = self.process_corext_group_delete(group_num, group_rows)
+                total_processed += group_processed
+                    
+            except Exception as e:
+                print(f"  Erreur DELETE Groupe {group_num}: {e}")
+    
+    # 2. TRAITER LES INSERT ENSUITE (par groupe)  
+    if insert_groups:
+        print(f"\n=== COREXT PHASE 2: {len(insert_groups)} groupes INSERT ===")
+        for group_num, group_rows in insert_groups:
+            try:
+                print(f"\n--- INSERT Groupe {group_num}: {len(group_rows)} lignes ---")
+                self.print_group_info(group_rows)
+                
+                group_processed = self.process_corext_group_insert(group_num, group_rows)
+                total_processed += group_processed
+                    
+            except Exception as e:
+                print(f"  Erreur INSERT Groupe {group_num}: {e}")
+    
+    print(f"\nCOREXT terminé: {total_processed} groupes traités")
+    return total_processed
+
+def print_group_info(self, group_rows):
+    """Affiche les infos d'un groupe pour debug"""
+    if not group_rows:
+        return
+        
+    first_row = group_rows[0]
+    product = first_row.get('Product', 'N/A')
+    cdrset = first_row.get('CDRSet', 'N/A') 
+    cdr = first_row.get('CDR', 'N/A')
+    
+    sides = [row.get('Side', 'N/A') for row in group_rows]
+    
+    print(f"    Product={product}, CDRSet={cdrset}, CDR={cdr}")
+    print(f"    Sides: {sides}")
+    print(f"    Lignes: {[f\"Row{i+1}\" for i in range(len(group_rows))]}")
+
+def process_corext_group_insert(self, group_num, group_rows):
+    """
+    Traite un groupe COREXT INSERT avec group_rows = [{row1}, {row2}, {row3}...]
+    """
+    print(f"  Traitement du groupe INSERT {group_num}")
+    
+    try:
+        # ÉTAPE 1: Exécuter les 3 SELECT avec toutes les lignes du groupe
+        print(f"    ÉTAPE 1: Exécution des 3 SELECT pour le groupe")
+        select_w_data = self.execute_corext_select_w(group_num, group_rows)
+        select_x_data = self.execute_corext_select_x(group_num, group_rows) 
+        select_y_data = self.execute_corext_select_y_join(group_num, group_rows)
+        
+        print(f"      SELECT w: {len(select_w_data) if select_w_data else 0} résultats")
+        print(f"      SELECT x: {len(select_x_data) if select_x_data else 0} résultats")
+        print(f"      SELECT y: {len(select_y_data) if select_y_data else 0} résultats")
+        
+        # ÉTAPE 2: INSERT z avec les résultats des SELECT
+        print(f"    ÉTAPE 2: INSERT z avec données des SELECT")
+        combined_data_for_z = self.combine_data_for_insert_z(select_w_data, select_x_data, select_y_data)
+        
+        insert_z_id = self.execute_insert_z(combined_data_for_z)
+        print(f"      INSERT z réussi, ID récupéré: {insert_z_id}")
+        
+        # ÉTAPE 3: INSERT dans xx (table 1) avec ID.z + données de w
+        print(f"    ÉTAPE 3: INSERT xx table 1 avec ID.z + données w")
+        self.execute_insert_xx_table1(insert_z_id, select_w_data)
+        
+        # ÉTAPE 4: INSERT dans xx (table 2) avec ID.z + données de x  
+        print(f"    ÉTAPE 4: INSERT xx table 2 avec ID.z + données x")
+        self.execute_insert_xx_table2(insert_z_id, select_x_data)
+        
+        print(f"    Groupe INSERT {group_num} terminé avec succès")
+        return 1
+        
+    except Exception as e:
+        print(f"    Erreur dans le traitement du groupe INSERT {group_num}: {e}")
+        return 0
+
+def execute_corext_select_w(self, group_key, group_rows):
+    """SELECT w pour un groupe"""
+    print(f"      Exécution SELECT w...")
+    # Utiliser group_key (Product, CDR_REF, CDR) pour construire la requête
+    # + données de toutes les lignes du groupe
+    # cursor.execute("SELECT ... FROM table_w WHERE product = ? AND cdr_ref = ? AND cdr = ?", group_key)
+    return [{"w_data": "value_w", "w_field": "test"}]
+
+def execute_corext_select_x(self, group_key, group_rows):
+    """SELECT x pour un groupe"""
+    print(f"      Exécution SELECT x...")
+    # cursor.execute("SELECT ... FROM table_x WHERE product = ? AND cdr_ref = ? AND cdr = ?", group_key)
+    return [{"x_data": "value_x", "x_field": "test"}]
+
+def execute_corext_select_y_join(self, group_key, group_rows):
+    """SELECT y avec JOIN pour un groupe"""
+    print(f"      Exécution SELECT y (avec JOIN)...")
+    # cursor.execute("SELECT ... FROM table_y1 JOIN table_y2 ON ... WHERE product = ? AND cdr_ref = ? AND cdr = ?", group_key)
+    return [{"y_data": "value_y", "y_join_field": "join_test"}]
+
+def combine_data_for_insert_z(self, select_w_data, select_x_data, select_y_data):
+    """Combine les données des 3 SELECT pour l'INSERT z"""
+    combined = {}
+    if select_w_data:
+        combined.update(select_w_data[0])
+    if select_x_data:
+        combined.update(select_x_data[0])
+    if select_y_data:
+        combined.update(select_y_data[0])
+    return combined
+
+def execute_insert_z(self, combined_data):
+    """INSERT z et récupère l'ID généré"""
+    print(f"        INSERT z avec données: {combined_data}")
+    # cursor.execute("INSERT INTO table_z (...) VALUES (...)", params)
+    # insert_z_id = cursor.lastrowid  # ou SCOPE_IDENTITY() en SQL Server
+    
+    # SIMULATION
+    insert_z_id = 12345
+    return insert_z_id
+
+def execute_insert_xx_table1(self, insert_z_id, select_w_data):
+    """INSERT dans xx table 1 avec ID.z + données w"""
+    print(f"        INSERT xx table1 avec ID.z={insert_z_id} + données w")
+    # cursor.execute("INSERT INTO xx_table1 (z_id, w_field, ...) VALUES (?, ?, ...)", [insert_z_id, ...])
+
+def execute_insert_xx_table2(self, insert_z_id, select_x_data):
+    """INSERT dans xx table 2 avec ID.z + données x"""
+    print(f"        INSERT xx table2 avec ID.z={insert_z_id} + données x")
+    # cursor.execute("INSERT INTO xx_table2 (z_id, x_field, ...) VALUES (?, ?, ...)", [insert_z_id, ...])
+
+def process_corext_group_delete(self, group_key, group_rows):
+    """Traite un groupe COREXT DELETE (logique similaire mais en sens inverse)"""
+    print(f"  Traitement du groupe DELETE: Product={group_key[0]}, CDR_REF={group_key[1]}, CDR={group_key[2]}")
+    # Implémenter la logique DELETE si nécessaire
+    return 1
+    """
+    Exécute les 4 requêtes SELECT COREXT et combine les résultats
+    """
+    print(f"  Exécution des 4 SELECT COREXT...")
+    all_data = {}
+    
+    for query_key, query_config in self.corext_config["select_queries"].items():
+        print(f"    Exécution {query_key}: {query_config['description']}")
+        
+        try:
+            if query_key == "query_4":  # Requête avec jointure (template SQL)
+                query_data = self.execute_corext_join_select(row_dict, query_config)
+            else:  # Requêtes simples sur une table
+                query_data = self.execute_corext_simple_select(row_dict, query_config)
+            
+            if query_data:
+                all_data[query_key] = query_data
+                print(f"      {query_key} OK: {len(query_data) if isinstance(query_data, list) else 1} résultat(s)")
+            else:
+                print(f"      {query_key} : Aucun résultat")
+                
+        except Exception as e:
+            print(f"      Erreur {query_key}: {e}")
+    
+    # Combiner toutes les données des 4 SELECT
+    if all_data:
+        combined_data = self.combine_select_results(all_data)
+        print(f"    Données combinées: {combined_data}")
+        return combined_data
+    else:
+        print(f"    Aucune donnée récupérée des 4 SELECT")
+        return None
+
+def execute_corext_simple_select(self, row_dict, query_config):
+    """Exécute une requête SELECT simple sur une table"""
+    table_name = query_config["table"]
+    columns = query_config["columns"]
+    where_mapping = query_config["where_mapping"]
+    
+    # Construire les conditions WHERE
+    conditions = []
+    params = []
+    
+    for excel_col, db_col in where_mapping.items():
+        if excel_col in row_dict and row_dict[excel_col] is not None:
+            conditions.append(f"{db_col} = ?")
+            params.append(str(row_dict[excel_col]).strip())
+    
+    if not conditions:
+        print(f"        Aucune condition WHERE pour {table_name}")
+        return None
+    
+    sql = f"SELECT {', '.join(columns)} FROM {table_name} WHERE {' AND '.join(conditions)}"
+    print(f"        SQL: {sql}")
+    print(f"        Params: {params}")
+    
+    # cursor.execute(sql, params)
+    # results = cursor.fetchall()
+    
+    # SIMULATION: retourner des données fictives
+    simulation_result = {col: f"VALUE_{col}_{row_dict.get('ID', 'TEST')}" for col in columns}
+    return [simulation_result]  # Liste de dictionnaires
+
+def execute_corext_join_select(self, row_dict, query_config):
+    """Exécute la requête SELECT avec jointure (query_4)"""
+    sql_template = query_config["sql_template"]
+    where_mapping = query_config["where_mapping"]
+    
+    # Construire les paramètres dans l'ordre des positions
+    params = [None] * len(where_mapping)  # Initialiser avec la bonne taille
+    
+    for excel_col, param_position in where_mapping.items():
+        if excel_col in row_dict and row_dict[excel_col] is not None:
+            params[param_position] = str(row_dict[excel_col]).strip()
+    
+    # Vérifier que tous les paramètres sont renseignés
+    if None in params:
+        print(f"        Paramètres manquants pour requête jointure: {params}")
+        return None
+    
+    print(f"        SQL JOIN: {sql_template.strip()}")
+    print(f"        Params: {params}")
+    
+    # cursor.execute(sql_template, params)
+    # results = cursor.fetchall()
+    
+    # SIMULATION: retourner des données fictives
+    simulation_result = {
+        "corext_id": row_dict.get("ID", "TEST_ID"),
+        "corext_name": row_dict.get("Name", "TEST_NAME"),
+        "detail_value": "JOIN_DETAIL_VALUE",
+        "config_param": "JOIN_CONFIG_PARAM",
+        "status": "ACTIVE",
+        "last_modified": "2025-01-30"
+    }
+    return [simulation_result]
+
+def combine_select_results(self, all_data):
+    """Combine les résultats des 4 SELECT en un seul dictionnaire"""
+    combined = {}
+    
+    for query_key, query_results in all_data.items():
+        if isinstance(query_results, list) and query_results:
+            # Prendre le premier résultat de chaque requête
+            for key, value in query_results[0].items():
+                # Préfixer avec le nom de la requête pour éviter les conflits
+                combined[f"{query_key}_{key}"] = value
+    
+    return combined
+
+def map_select_data_to_table(self, all_select_data, table_config):
+    """Mappe les données des SELECT vers les colonnes d'une table cible"""
+    columns_mapping = table_config["columns_mapping"]
+    mapped_data = {}
+    
+    for source_col, target_col in columns_mapping.items():
+        # Chercher la valeur dans toutes les données des SELECT
+        found = False
+        for key, value in all_select_data.items():
+            # Correspondance exacte ou avec préfixe de requête
+            if key == source_col or key.endswith(f"_{source_col}"):
+                mapped_data[target_col] = value
+                found = True
+                break
+        
+        if not found:
+            print(f"        Colonne source '{source_col}' non trouvée dans les SELECT")
+    
+    return mapped_data if mapped_data else None
+
+def build_corext_delete_query(self, table_name, table_data):
+    """Construit une requête DELETE pour COREXT avec les données mappées"""
+    conditions = []
+    params = []
+    
+    for db_col, value in table_data.items():
+        if value is not None and str(value).strip():
+            conditions.append(f"{db_col} = ?")
+            params.append(str(value).strip())
+    
+    if not conditions:
+        raise ValueError(f"Aucune condition WHERE valide pour DELETE sur {table_name}")
+    
+    sql = f"DELETE FROM {table_name} WHERE {' AND '.join(conditions)}"
+    return sql, params
+
+def build_corext_insert_query(self, table_name, table_data, table_config):
+    """Construit une requête INSERT pour COREXT avec les données mappées"""
+    columns = []
+    values_placeholders = []
+    params = []
+    
+    # Ajouter les colonnes mappées des SELECT
+    for db_col, value in table_data.items():
+        columns.append(db_col)
+        values_placeholders.append('?')
+        params.append(value)
+    
+    # Ajouter les variables SQL des SELECT comme colonnes
+    # Les valeurs des 4 SELECT sont maintenant disponibles dans table_data
+    # Elles peuvent être utilisées directement dans l'INSERT
+    
+    # Ajouter les colonnes automatiques COREXT
+    if "COREXT" in self.auto_columns_by_sheet:
+        for auto_col, auto_value in self.auto_columns_by_sheet["COREXT"].items():
+            columns.append(auto_col)
+            if auto_value == "GETDATE()":
+                values_placeholders.append("GETDATE()")
+            elif auto_value == "username_from_login":
+                values_placeholders.append("?")
+                params.append(self.username_var.get() or "SYSTEM")
+            else:
+                values_placeholders.append("?")
+                params.append(auto_value)
+    
+    if not columns:
+        raise ValueError(f"Aucune colonne valide pour INSERT sur {table_name}")
+    
+    sql = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(values_placeholders)})"
+    return sql, params
